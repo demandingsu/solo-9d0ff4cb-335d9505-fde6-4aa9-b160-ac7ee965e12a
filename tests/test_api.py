@@ -186,6 +186,108 @@ def test_cycle_rejected(client):
     assert "cycle" in errors
 
 
+def test_trace_response_includes_ambiguity_fields(client):
+    r = client.get(
+        "/trace",
+        params={
+            "child_part_no": "EC-100",
+            "batch": "B20261101",
+            "at_time": "2026-11-01T09:30:00Z",
+        },
+    )
+    body = r.json()
+    assert body["batch_found"] is True
+    assert body["ambiguous"] is False
+    assert body["pending_products"] == []
+    assert body["total_pending_products"] == 0
+    assert body["compatible_path_count"] == 1
+
+
+def test_trace_never_installed_batch_is_empty(client):
+    r = client.get(
+        "/trace",
+        params={
+            "child_part_no": "EC-100",
+            "batch": "B-NOT-IN-LOG",
+            "at_time": "2026-11-01T09:30:00Z",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["batch_found"] is False
+    assert body["affected_products"] == []
+    assert body["pending_products"] == []
+    assert body["open_chains"] == []
+    assert body["total_affected_products"] == 0
+    assert body["ambiguous"] is False
+
+
+def test_ambiguous_upload_reports_pending_then_resolves(client):
+    # Fresh product/batch identifiers so this does not perturb other tests.
+    r = upload(client, "ambiguous_same_part_two_products.csv")
+    assert r.status_code == 201, r.text
+
+    params = {
+        "child_part_no": "EC-600",
+        "batch": "B600",
+        "at_time": "2026-11-06T09:30:00Z",
+    }
+    body = client.get("/trace", params=params).json()
+    assert body["batch_found"] is True
+    assert body["ambiguous"] is True
+    assert body["total_affected_products"] == 0
+    assert body["total_pending_products"] == 2
+    assert {p["root_part_no"] for p in body["pending_products"]} == {
+        "P-6001",
+        "P-6002",
+    }
+    assert all(p["path"] for p in body["pending_products"])
+
+    # Later REMOVE of one parent instance makes P-6001 the only attribution.
+    r = upload(client, "ambiguity_remove_later.csv")
+    assert r.status_code == 201, r.text
+    body = client.get("/trace", params=params).json()
+    assert body["ambiguous"] is True  # the query is before the removal
+    assert body["total_pending_products"] == 2
+
+    later = dict(params, at_time="2026-11-06T12:00:00Z")
+    body = client.get("/trace", params=later).json()
+    assert body["ambiguous"] is False
+    assert body["affected_products"][0]["root_part_no"] == "P-6001"
+    assert [s["event_no"] for s in body["affected_products"][0]["path"]] == [
+        "A003",
+        "A001",
+    ]
+
+
+def test_convergent_batches_are_confirmed_and_backfill_splits(client):
+    r = upload(client, "convergent_same_product.csv")
+    assert r.status_code == 201, r.text
+
+    params = {
+        "child_part_no": "EC-601",
+        "batch": "B601",
+        "at_time": "2026-11-07T09:30:00Z",
+    }
+    body = client.get("/trace", params=params).json()
+    assert body["ambiguous"] is False
+    assert body["total_affected_products"] == 1
+    assert body["compatible_path_count"] == 2
+    assert {p["root_part_no"] for p in body["affected_products"]} == {"P-6010"}
+    entry = body["affected_products"][0]
+    assert entry["root_batches"] == ["LOT-C", "LOT-D"]
+    assert len(entry["compatible_paths"]) == 2
+
+    # A backfilled earlier event adds a third plausible parent instance under
+    # a different product; the next query is recomputed and splits the result.
+    r = upload(client, "backfill_split_parent_instance.csv")
+    assert r.status_code == 201, r.text
+    body = client.get("/trace", params=params).json()
+    assert body["ambiguous"] is True
+    assert body["total_affected_products"] == 0
+    assert body["total_pending_products"] == 2
+
+
 def test_backfill_orphan_rejected_and_old_data_intact(client):
     before = client.get("/events").json()
     r = upload(client, "backfill_orphan_rejected.csv")

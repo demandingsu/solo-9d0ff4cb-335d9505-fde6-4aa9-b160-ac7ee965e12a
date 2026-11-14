@@ -28,9 +28,23 @@ CSV 为 UTF-8 编码（允许 BOM），表头支持中英文，列顺序不限�
 
 ## 2. 业务规则
 
-* **按批次 + 时刻追溯**：`GET /trace` 返回该时刻仍装有指定批次子件的全部
-  成品，以及从缺陷板件到成品的多级装配事件路径（每一级的装入/拆出事件号、
-  时间、动作、父子件、批次）。
+* **按批次 + 时刻追溯**：`GET /trace` 返回该时刻仍装有指定批次子件的成品，
+  以及从缺陷板件到成品的多级装配事件路径（每一级的装入事件号、时间、动作、
+  父子件、批次）。
+* **起算点精确**：只从查询批次**真实存在**的生效装入记录起算。该批次从未
+  装入、或查询时刻前已拆出时，`batch_found=false` 且所有结果为空——不会再
+  把同型号其它批次误报为受影响。
+* **父件批次未知时分开返回**：板件装入记录只写父件号，不写父件实例批次。
+  同一父件号的多个批次可能分别装在两台成品里，此时无法唯一确定板件在哪一
+  台中：
+  * `affected_products`（**确定受影响**）：所有与日志相容的归属路径最终都
+    到达同一个成品。不同中间件批次**汇合**到同一成品时仍算确定受影响，路径
+    逐条给出以便核对；
+  * `pending_products`（**待核实**）：存在多条归属路径且指向不同成品（或
+    其中有在制链路），成品与对应事件路径一并返回，需人工核实；
+  * `open_chains`：顶端还不是成品（无 `P-` 序列号）的在制链路。
+* **按查询时刻重新判定**：拆出、补录上传后，下一次查询都会以该时刻的生效
+  边重新计算；补录较早的返修事件也会参与重放。
 * **拆出后不再命中**：时刻晚于（或等于）拆出事件的查询不会命中该成品；
   之后的重装/流转会产生新的归属链路。
 * **允许补录较早的返修事件**：上传不要求按事件时间有序。每次上传都把
@@ -59,13 +73,14 @@ CSV 为 UTF-8 编码（允许 BOM），表头支持中英文，列顺序不限�
 | GET | `/docs` | Swagger UI 交互式文档（可直接演示） |
 | GET | `/help` | 内嵌的中文演示指引页 |
 
-`/trace` 响应示例：
+`/trace` 响应示例（确定受影响）：
 
 ```json
 {
   "queried_at": "2026-11-01T09:30:00Z",
   "child_part_no": "EC-100",
   "child_batch": "B20261101",
+  "batch_found": true,
   "affected_products": [
     {
       "root_part_no": "P-1001",
@@ -77,12 +92,21 @@ CSV 为 UTF-8 编码（允许 BOM），表头支持中英文，列顺序不限�
       ]
     }
   ],
+  "pending_products": [],
   "open_chains": [],
-  "total_affected_products": 1
+  "total_affected_products": 1,
+  "total_pending_products": 0,
+  "ambiguous": false,
+  "compatible_path_count": 1
 }
 ```
 
-`open_chains` 为顶端还不是成品（无 `P-` 序列号）的在制链路，便于追溯在制品。
+待核实时，成品出现在 `pending_products`，`affected_products` 为空，
+`total_affected_products=0`、`ambiguous=true`。每个成品条目还带有
+`root_batches`（所有相容的父件批次）与 `compatible_paths`（所有相容事件
+路径），`path` 为其中第一条以保持兼容；同一成品经多条路径**汇合**时只计
+一个成品，但全部路径都会列出。`compatible_path_count` 是与该时刻日志相容
+的事件路径总数。
 
 ## 4. Docker Compose 启动（推荐）
 
@@ -109,10 +133,22 @@ TRACE_DB_PATH=./trace.db uvicorn app.main:app --reload --port 8000
 1. `POST /uploads` → `file` 选择 `samples/events_valid.csv` → Execute；
 2. `GET /trace` 输入 `child_part_no=EC-100`、`batch=B20261101`、
    `at_time=2026-11-01T09:30:00Z` → 命中 `P-1001`；
-3. 把时刻改成 `2026-11-01T10:30:00Z`（拆出后）→ 0 命中；
+3. 把时刻改成 `2026-11-01T10:30:00Z`（拆出后）→ `batch_found=false`、0 命中；
 4. 再上传 `samples/invalid_two_parents.csv` / `invalid_orphan_remove.csv` /
    `invalid_cycle.csv`，观察 422 拒收与详细错误，且旧查询结果不变；
-5. 重传同一个合法 CSV → `new_events=0, duplicate_events=11`。
+5. 重传同一个合法 CSV → `new_events=0, duplicate_events=11`；
+6. **歧义演示**：上传 `samples/ambiguous_same_part_two_products.csv`，查询
+   `child_part_no=EC-600&batch=B600&at_time=2026-11-06T09:30:00Z` →
+   `P-6001`、`P-6002` 均在 `pending_products`（待核实），
+   `total_affected_products=0`、`ambiguous=true`；
+7. **拆出后重新判定**：再上传 `samples/ambiguity_remove_later.csv`，把时刻
+   改成 `2026-11-06T12:00:00Z` → 只剩 `P-6001`，进入 `affected_products`；
+8. **汇合演示**：上传 `samples/convergent_same_product.csv`，查询
+   `child_part_no=EC-601&batch=B601&at_time=2026-11-07T09:30:00Z` →
+   两条相容路径都到达 `P-6010`，`total_affected_products=1`、
+   `compatible_path_count=2`、`ambiguous=false`；
+9. **补录拆分**：上传 `samples/backfill_split_parent_instance.csv` 后重查同一
+   批次 → 多出一个在 `P-6011` 下的可能实例，结果变为待核实。
 
 ## 6. 样例文件说明
 
@@ -125,6 +161,10 @@ TRACE_DB_PATH=./trace.db uvicorn app.main:app --reload --port 8000
 | `backfill_repair_accepted.csv` | 接受：补录早于现有事件的返修（装入+拆出） |
 | `backfill_orphan_rejected.csv` | 拒收：补录的拆出按事件时间重放后无对应装入 |
 | `conflict_dup_event_no.csv` | 拒收：事件号相同但内容不同 |
+| `ambiguous_same_part_two_products.csv` | 歧义：`SA-600` 两批次分别装入 `P-6001`/`P-6002`，查询 `EC-600/B600` 时两个成品均为待核实 |
+| `ambiguity_remove_later.csv` | 拆出 `LOT-B` 后，较晚时刻重查只剩 `P-6001` 确定受影响 |
+| `convergent_same_product.csv` | 汇合：`SA-601` 两批次都装入 `P-6010`，所有路径到同一成品 → 确定受影响 |
+| `backfill_split_parent_instance.csv` | 补录使 `SA-601` 多出一个装在 `P-6011` 的可能实例 → 重新判定为待核实 |
 
 ## 7. 测试
 
@@ -135,7 +175,8 @@ python -m pytest tests/ -q
 
 测试覆盖：合法上传与多级追溯、拆出后不命中、换批与成品流转、补录接受/
 拒收、三类结构违规、幂等与同号冲突、坏时间戳/缺列 400、上传与查询并发时
-快照始终完整（17 个用例）。
+快照始终完整，以及**未装入批次不误报、父件批次歧义、路径汇合、补录后重新
+判定**（31 个用例，其中 `tests/test_trace_ambiguity.py` 为纯追溯逻辑用例）。
 
 ## 8. 目录结构
 
@@ -145,7 +186,7 @@ app/
   database.py    # SQLite 连接、WAL、建表、写锁
   timeutil.py    # UTC 解析与微秒时间戳
   csvparse.py    # CSV 解析（中英文表头/动作别名）
-  replay.py      # 事件时间重放、结构校验、时刻追溯
+  replay.py      # 事件时间重放、结构校验、精确起算与歧义/汇合追溯
   service.py     # 上传事务：幂等检查 → 全量重放 → 原子提交/审计
   schemas.py     # 响应模型
   main.py        # FastAPI 路由
@@ -157,8 +198,11 @@ docker-compose.yml / Dockerfile / demo.sh
 ## 9. 设计说明与边界
 
 * 事件时间内部存为 UTC 微秒整数，保证重放顺序确定（时间戳并列按事件号）。
-* 追溯沿“时刻有效边”自底向上 DFS；当同一中间件物料号存在多个并行实例而
-  事件中无法区分实例批次时，链路向上展开采用**宁可多报候选、不漏报缺陷
-  成品**的保守策略；样例数据中各装配件实例均有独立批次，路径精确。
+* 追溯起点精确到 `(子件号, 批次)` 的生效装入边，不再回退到同型号的其它批次。
+* 向上展开时，日志只给出父件号、没有父件实例批次，因此把该父件号在当前
+  时刻的每个生效实例（每个批次一条边）都视为**相容归属**并继续向上：
+  * 若所有相容路径到达同一成品 → 确定受影响（含多路径汇合的情况）；
+  * 若到达不同成品、或其中一支仍在制 → 成品进入待核实，并保留各自事件路径。
+  这一策略既不漏报，也不会把无法唯一确定的成品误标为确定受影响。
 * SQLite 单写者模型适合本场景的写入规模；如需水平扩展可将存储替换为
   Postgres，接口与重放逻辑不变。

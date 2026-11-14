@@ -34,9 +34,18 @@ app = FastAPI(
     description=(
         "上传装配/返修事件 CSV（装入 INSTALL / 拆出 REMOVE），"
         "按子件批次与 UTC 时刻追溯仍装有该批次板件的成品（P- 开头序列号）"
-        "及多级装配事件路径。"
+        "及多级装配事件路径。\n\n"
+        "**指定批次 + 指定时刻**：只从该批次真实的生效装入记录起算；从未装入"
+        "或查询时刻前已拆出的批次不会报出任何成品。\n\n"
+        "**两种结果分开返回**：\n"
+        "* `affected_products`（确定受影响）：所有与日志相容的归属路径都到达同一个成品；\n"
+        "* `pending_products`（待核实）：父件批次无法唯一确定，成品及事件路径仍需人工核实。\n\n"
+        "**/docs 演示**：上传 `samples/ambiguous_same_part_two_products.csv` 后查询 "
+        "`EC-600 / B600 / 2026-11-06T09:30:00Z` 得到两个待核实成品（歧义）；"
+        "上传 `samples/convergent_same_product.csv` 后查询 "
+        "`EC-601 / B601 / 2026-11-07T09:30:00Z` 得到同一个确定受影响成品（汇合）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -124,14 +133,18 @@ def trace(
         events = [Event(**dict(r)) for r in rows]
 
     result = trace_batch(events, child_part_no, batch, at_us)
-    products = result["products"]
     return TraceResponse(
         queried_at=to_iso(dt),
         child_part_no=child_part_no,
         child_batch=batch,
-        affected_products=products,
+        batch_found=result["batch_found"],
+        affected_products=result["products"],
+        pending_products=result["pending_products"],
         open_chains=result["open_chains"],
-        total_affected_products=len(products),
+        total_affected_products=result["total_affected_products"],
+        total_pending_products=result["total_pending_products"],
+        ambiguous=result["ambiguous"],
+        compatible_path_count=result["compatible_path_count"],
     )
 
 
@@ -179,5 +192,21 @@ E003,2026-11-01T10:00:00Z,SA-200,EC-100,B20261101,拆出</pre>
     <h2>2. 追溯（GET /trace）</h2>
     <p><code>/trace?child_part_no=EC-100&amp;batch=B20261101&amp;at_time=2026-11-01T09:30:00Z</code></p>
     <p>拆出时刻之后的查询不再命中该成品；补录的较早事件会与全量日志一起按事件时间重算校验。</p>
+    <h2>3. 歧义与汇合（/docs 可直接演示）</h2>
+    <p><b>歧义</b>：上传 <code>samples/ambiguous_same_part_two_products.csv</code>，查询
+     <code>/trace?child_part_no=EC-600&amp;batch=B600&amp;at_time=2026-11-06T09:30:00Z</code>。
+     同一型号 <code>SA-600</code> 的两个批次分别装进 <code>P-6001</code> 与 <code>P-6002</code>，
+     板件装入记录只写父件号，无法确定板件在哪一台里：两个成品进入
+     <code>pending_products</code>（待核实），<code>total_affected_products=0</code>。</p>
+    <p>再上传 <code>samples/ambiguity_remove_later.csv</code>，把查询时刻改到
+     <code>2026-11-06T12:00:00Z</code>（拆出 <code>LOT-B</code> 之后）：
+     只剩一条归属路径，<code>P-6001</code> 变为确定受影响。</p>
+    <p><b>汇合</b>：上传 <code>samples/convergent_same_product.csv</code>，查询
+     <code>/trace?child_part_no=EC-601&amp;batch=B601&amp;at_time=2026-11-07T09:30:00Z</code>。
+     <code>SA-601</code> 的两个批次都装进同一个成品 <code>P-6010</code>，所有相容路径
+     最终到达同一成品，因此仍算确定受影响（<code>total_affected_products=1</code>，
+     <code>path</code> 会给出多条相容事件路径以便核对）。</p>
+    <p>从未装入的批次（如 <code>batch=B-NOT-IN-LOG</code>）返回
+     <code>batch_found=false</code> 与空结果，不再误报。</p>
     </body></html>
     """

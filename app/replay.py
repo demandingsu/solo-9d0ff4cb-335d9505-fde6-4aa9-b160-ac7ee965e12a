@@ -207,78 +207,200 @@ def _step(ev: Event, action_label: str) -> dict:
     }
 
 
+@dataclass
+class _AttributionPath:
+    """One complete, log-compatible attribution of the queried batch.
+
+    ``edges`` are the active edges walked from the queried board upwards.  The
+    last edge's ``child_batch`` is the batch of the assembly named in
+    ``terminal_part`` (the batch that was installed into the parent above it);
+    it is what the existing ``root_batch`` field reports.
+    """
+
+    terminal_part: str
+    terminal_batch: str
+    edges: list[ActiveEdge]
+
+    @property
+    def is_product(self) -> bool:
+        return self.terminal_part.startswith(PRODUCT_PREFIX)
+
+    def steps(self) -> list[dict]:
+        steps: list[dict] = []
+        for edge in self.edges:
+            steps.append(_step(edge.install, "INSTALL"))
+            if edge.remove is not None:
+                steps.append(_step(edge.remove, "REMOVE"))
+        return steps
+
+
+def _group_by_product(paths: list[_AttributionPath]) -> list[dict]:
+    """Collapse paths by terminal part.
+
+    Every compatible path is preserved in ``compatible_paths`` so the
+    attribution can be audited.  ``path`` repeats the first path for
+    backwards compatibility, and ``root_batch`` is that path's parent-assembly
+    batch; when several batches converge, ``root_batches`` lists them all.
+    """
+    grouped: dict[str, list[_AttributionPath]] = {}
+    for path in paths:
+        grouped.setdefault(path.terminal_part, []).append(path)
+
+    result: list[dict] = []
+    for terminal, group in grouped.items():
+        batches: list[str] = []
+        for path in group:
+            if path.terminal_batch not in batches:
+                batches.append(path.terminal_batch)
+        paths_out = [path.steps() for path in group]
+        result.append(
+            {
+                "root_part_no": terminal,
+                "root_batch": group[0].terminal_batch,
+                "root_batches": batches,
+                "is_finished_product": group[0].is_product,
+                "path": paths_out[0],
+                "compatible_paths": paths_out,
+            }
+        )
+    return result
+
+
+def _enumerate_attributions(
+    edges: list[ActiveEdge],
+    child_part_no: str,
+    child_batch: str,
+) -> list[_AttributionPath]:
+    """Enumerate every attribution path compatible with the active log.
+
+    The starting point is exact: only edges whose *child* is the queried
+    ``(part, batch)`` are considered.  A batch that is not mounted at the
+    query moment therefore yields no paths at all (it was never installed, or
+    it has already been removed).
+
+    Above the first level the log does not record the batch of the parent
+    assembly: an INSTALL event only names ``parent_part_no``.  Consequently
+    each active instance of that part number — that is, every active edge whose
+    ``child_part`` equals it, one per batch — is a possible attribution, and
+    all of them are followed.  If every one of those paths ends at the same
+    finished product, the product is still certain; otherwise the result is
+    ambiguous and has to be verified manually.
+    """
+    by_child_part: dict[str, list[ActiveEdge]] = {}
+    for e in edges:
+        by_child_part.setdefault(e.child_part, []).append(e)
+
+    roots = [
+        e
+        for e in edges
+        if e.child_part == child_part_no and e.child_batch == child_batch
+    ]
+
+    paths: list[_AttributionPath] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+
+    def record(terminal_part: str, steps: list[ActiveEdge]) -> None:
+        terminal_batch = steps[-1].child_batch if steps else child_batch
+        signature = (terminal_part, tuple(e.install.event_no for e in steps))
+        if signature in seen:
+            return
+        seen.add(signature)
+        paths.append(
+            _AttributionPath(terminal_part, terminal_batch, list(steps))
+        )
+
+    def visit(part: str, steps: list[ActiveEdge], guard: frozenset) -> None:
+        if part.startswith(PRODUCT_PREFIX):
+            # A finished product is the top of the chain even if it also
+            # appears as a child somewhere else in the log.
+            record(part, steps)
+            return
+
+        candidates = [
+            e for e in by_child_part.get(part, []) if e.edge not in guard
+        ]
+        if not candidates:
+            # In-progress assembly: its own parent is not known yet.
+            record(part, steps)
+            return
+
+        for edge in candidates:
+            visit(
+                edge.parent,
+                steps + [edge],
+                guard | {edge.edge},
+            )
+
+    for root in roots:
+        visit(root.parent, [root], frozenset({root.edge}))
+
+    return paths
+
+
 def trace_batch(
     events: list[Event],
     child_part_no: str,
     child_batch: str,
     at_us: int,
 ) -> dict:
-    """Find every finished product containing the queried child batch at
-    ``at_us`` and return the multi-level assembly event path for each.
+    """Trace the queried child batch at ``at_us``.
 
-    A path walks upward from the queried batch through every active parent
-    edge. Paths ending at a ``P-`` serial are affected finished products; the
-    rest are open chains whose top assembly is not (yet) a finished product.
+    The result separates three kinds of chains:
+
+    * ``products`` (确定受影响): every log-compatible attribution path ends at
+      the *same* finished product;
+    * ``pending_products`` (待核实): at least one finished product is reached,
+      but the attribution is ambiguous — different plausible parent-assembly
+      batches lead to different products, or one branch is still in progress;
+    * ``open_chains``: paths whose top assembly is not (yet) a ``P-`` serial.
+
+    ``batch_found`` is false when the queried batch has no active INSTALL at
+    the query moment; in that case all lists are empty.
     """
     edges = active_edges_at(events, at_us)
+    paths = _enumerate_attributions(edges, child_part_no, child_batch)
 
-    # parent part -> list of ActiveEdge objects mounted under it
-    by_parent: dict[str, list[ActiveEdge]] = {}
-    # child part -> list of edges (batch identity is carried per edge)
-    by_child_part: dict[str, list[ActiveEdge]] = {}
-    for e in edges:
-        by_parent.setdefault(e.parent, []).append(e)
-        by_child_part.setdefault(e.child_part, []).append(e)
+    product_paths = [p for p in paths if p.is_product]
+    open_paths = [p for p in paths if not p.is_product]
+    distinct_products = {p.terminal_part for p in product_paths}
+    distinct_terminals = {
+        (p.terminal_part, p.terminal_batch) for p in paths
+    }
 
-    products: list[dict] = []
-    open_chains: list[dict] = []
-    seen_product_paths: set[tuple[str, tuple]] = set()
+    # Certainty rule: the physical board exists exactly once, so a product is
+    # definitely affected only when *every* compatible attribution ends at it.
+    # Different parent-assembly batches that reconverge on the same product do
+    # not create uncertainty.
+    confirmed = (
+        len(distinct_products) == 1
+        and not open_paths
+        and bool(product_paths)
+    )
 
-    def walk(part: str, batch: str, steps: list[dict], guard: frozenset) -> None:
-        parents = by_child_part.get(part, [])
-        # Choose edges whose batch matches when the caller tracks a batch;
-        # above the first level the batch of an intermediate assembly is not
-        # encoded in the child event, so fall back to all matching edges
-        # (over-approximation: better to over-report candidates than miss a
-        # unit containing the defective batch).
-        candidates = [e for e in parents if e.child_batch == batch] or list(parents)
-        if not candidates:
-            chain = {
-                "root_part_no": part,
-                "root_batch": batch,
-                "is_finished_product": part.startswith(PRODUCT_PREFIX),
-                "path": steps,
-            }
-            if part.startswith(PRODUCT_PREFIX):
-                sig = (part, tuple(s["event_no"] for s in steps))
-                if sig not in seen_product_paths:
-                    seen_product_paths.add(sig)
-                    products.append(chain)
-            else:
-                open_chains.append(chain)
-            return
+    if confirmed:
+        products = _group_by_product(product_paths)
+        pending_products: list[dict] = []
+    else:
+        products = []
+        pending_products = _group_by_product(product_paths)
 
-        for edge in candidates:
-            if edge.edge in guard:
-                # Defensive: validated data has no cycles, but never loop
-                # forever on a snapshot.
-                continue
-            next_steps = steps + [
-                _step(edge.install, "INSTALL"),
-                *([_step(edge.remove, "REMOVE")] if edge.remove else []),
-            ]
-            walk(
-                edge.parent,
-                edge.child_batch,
-                next_steps,
-                guard | {edge.edge},
-            )
+    open_chains = _group_by_product(open_paths)
 
-    walk(child_part_no, child_batch, [], frozenset())
+    # Ambiguous means the log admits more than one possible top chain. A lone
+    # in-progress chain is not ambiguous — it simply has no product yet.
+    ambiguous = not confirmed and len(distinct_terminals) > 1
 
     return {
         "child_part_no": child_part_no,
         "child_batch": child_batch,
+        "batch_found": bool(paths),
         "products": products,
+        "pending_products": pending_products,
         "open_chains": open_chains,
+        "total_affected_products": len(distinct_products) if confirmed else 0,
+        "total_pending_products": (
+            0 if confirmed else len(distinct_products)
+        ),
+        "ambiguous": ambiguous,
+        "compatible_path_count": len(paths),
     }

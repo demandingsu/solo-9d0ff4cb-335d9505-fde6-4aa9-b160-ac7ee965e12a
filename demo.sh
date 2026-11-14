@@ -40,5 +40,23 @@ echo ">> 5) 结构非法上传（整份拒收，HTTP 422，旧数据不变）"
 curl -s -X POST "http://127.0.0.1:$PORT/uploads" \
   -F "file=@samples/invalid_two_parents.csv;type=text/csv"
 echo; echo
+echo ">> 6) 歧义：同型号 SA-600 两批次分别装在两台成品，板件批次无法唯一归属"
+curl -s -X POST "http://127.0.0.1:$PORT/uploads" \
+  -F "file=@samples/ambiguous_same_part_two_products.csv;type=text/csv" >/dev/null
+curl -s "http://127.0.0.1:$PORT/trace?child_part_no=EC-600&batch=B600&at_time=2026-11-06T09:30:00Z"
+echo; echo
+echo ">> 7) 拆出后按查询时刻重判：LOT-B 拆出后只剩 P-6001 确定受影响"
+curl -s -X POST "http://127.0.0.1:$PORT/uploads" \
+  -F "file=@samples/ambiguity_remove_later.csv;type=text/csv" >/dev/null
+curl -s "http://127.0.0.1:$PORT/trace?child_part_no=EC-600&batch=B600&at_time=2026-11-06T12:00:00Z"
+echo; echo
+echo ">> 8) 汇合：SA-601 两批次都装进同一成品 P-6010，仍为确定受影响"
+curl -s -X POST "http://127.0.0.1:$PORT/uploads" \
+  -F "file=@samples/convergent_same_product.csv;type=text/csv" >/dev/null
+curl -s "http://127.0.0.1:$PORT/trace?child_part_no=EC-601&batch=B601&at_time=2026-11-07T09:30:00Z"
+echo; echo
+echo ">> 9) 从未装入的批次：batch_found=false，空结果（不误报）"
+curl -s "http://127.0.0.1:$PORT/trace?child_part_no=EC-600&batch=B-NOT-IN-LOG&at_time=2026-11-06T09:30:00Z"
+echo; echo
 echo ">> 浏览器打开 http://127.0.0.1:$PORT/docs 可交互演示；Ctrl-C 退出。"
 wait $SERVER_PID
